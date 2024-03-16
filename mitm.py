@@ -1,50 +1,53 @@
 import json
 import threading
 import asyncio
-import signal
 import time
 import re
+import os
+import pathlib
+import subprocess
 import mitmproxy.addonmanager
 import mitmproxy.http
 import mitmproxy.log
 import mitmproxy.tcp
 import mitmproxy.websocket
-from pathlib import Path
-from optparse import OptionParser
+
 from mitmproxy import proxy, options, ctx
 from mitmproxy.tools.dump import DumpMaster
 from xmlrpc.server import SimpleXMLRPCServer
-from playwright.sync_api import sync_playwright, WebSocket
-from playwright.sync_api._generated import Page
 
-activated_flows = [] # store all flow.id ([-1] is the recently opened)
-messages_dict = dict() # flow.id -> Queue[flow_msg]
-stop = False
+from my_logger import logger
+from browser import Browser
+
+global_activated_flows = [] # store all flow.id ([-1] is the recently opened)
+global_messages_dict = dict() # flow.id -> Queue[flow_msg]
 
 class ClientWebSocket:
+    """ mitm addon for websocket"""
 
     def __init__(self):
         pass
 
     def websocket_start(self, flow: mitmproxy.http.HTTPFlow):
         assert isinstance(flow.websocket, mitmproxy.websocket.WebSocketData)
-        global activated_flows,messages_dict
+        global global_activated_flows,global_messages_dict
         
-        activated_flows.append(flow.id)
-        messages_dict[flow.id]=[]
+        global_activated_flows.append(flow.id)
+        global_messages_dict[flow.id]=[]
 
     def websocket_message(self, flow: mitmproxy.http.HTTPFlow):
         assert isinstance(flow.websocket, mitmproxy.websocket.WebSocketData)
-        global activated_flows,messages_dict
+        global global_activated_flows,global_messages_dict
 
-        messages_dict[flow.id].append(flow.websocket.messages[-1].content)
+        global_messages_dict[flow.id].append(flow.websocket.messages[-1].content)
 
     def websocket_end(self, flow: mitmproxy.http.HTTPFlow):
-        global activated_flows,messages_dict
-        activated_flows.remove(flow.id)
-        messages_dict.pop(flow.id)
+        global global_activated_flows,global_messages_dict
+        global_activated_flows.remove(flow.id)
+        global_messages_dict.pop(flow.id)
 
 class ClientHTTP:
+    """ mitm addon"""
     def __init__(self):
         pass
 
@@ -60,35 +63,27 @@ class ClientHTTP:
             elif re.search(r'^https://mahjongsoul\.game\.yo-star\.com/v[0-9\.]+\.w/code\.js$', flow.request.url):
                 flow.request.url = "http://cdn.jsdelivr.net/gh/Avenshy/majsoul_mod_plus/safe_code.js"
 
-async def start_proxy(host, port, enable_unlocker):
-    opts = options.Options(listen_host=host, listen_port=port)
-
-    master = DumpMaster(
-        opts,
-        with_termlog=False,
-        with_dumper=False,
-    )
-    master.addons.add(ClientWebSocket())
-    if enable_unlocker:
-        master.addons.add(ClientHTTP())
-    from mhm.addons import WebSocketAddon as Unlocker
-    master.addons.add(Unlocker())
-    await master.run()
-    return master
-
-# Create a XMLRPC server
 class LiqiServer:
+    """ XMLRPC server that provides an interface for bot to access the intercepted game data.
+    It also performs game inputs (actions)"""
+    
     _rpc_methods_ = ['get_activated_flows', 'get_messages', 'reset_message_idx', 'page_clicker', 'do_autohu', 'ping']
-    def __init__(self, host, port):
+    def __init__(self, host, port, browser:Browser = None):
         self.host = host
         self.port = port
+        self.browser = browser
+        
         self.server = SimpleXMLRPCServer((self.host, self.port), allow_none=True, logRequests=False)
         for name in self._rpc_methods_:
             self.server.register_function(getattr(self, name))
         self.message_idx = dict() # flow.id -> int
+    
+    def __del__(self):
+        # shutdown before destruction
+        self.shut_down()
 
     def get_activated_flows(self):
-        return activated_flows
+        return global_activated_flows
     
     def get_messages(self, flow_id):
         try:
@@ -96,146 +91,173 @@ class LiqiServer:
         except KeyError:
             self.message_idx[flow_id] = 0
             idx = 0
-        if (flow_id not in activated_flows) or (len(messages_dict[flow_id])==0) or (self.message_idx[flow_id]>=len(messages_dict[flow_id])):
+        if (flow_id not in global_activated_flows) or (len(global_messages_dict[flow_id])==0) or (self.message_idx[flow_id]>=len(global_messages_dict[flow_id])):
             return None
-        msg = messages_dict[flow_id][idx]
+        msg = global_messages_dict[flow_id][idx]
         self.message_idx[flow_id] += 1
         return msg
     
     def reset_message_idx(self):
-        for flow_id in activated_flows:
+        for flow_id in global_activated_flows:
             self.message_idx[flow_id] = 0
 
     def page_clicker(self, xy):
-        global click_list
-        click_list.append(xy)
+        if self.browser:
+            scale = self.browser.width/16
+            x = int(xy[0]*scale)
+            y = int(xy[1]*scale)
+            self.browser.mouse_click(x, y)
         return True
 
     def do_autohu(self):
-        global do_autohu
-        do_autohu = True
+        if self.browser:
+            self.browser.auto_hu()
         return True
 
     def ping(self):
         return True
 
-    def serve_forever(self):
-        print(f"XMLRPC Server is running on {self.host}:{self.port}")
+    def start(self):
+        """ Start the XMLRPC server (blocking)"""
+        logger.info(f"XMLRPC Server is running on {self.host}:{self.port}")
         self.server.serve_forever()
+        
+    def shut_down(self):
+        logger.info(f"Shutting down XMLRPC Server")
+        self.server.shutdown()
 
-if __name__ == '__main__':
-    with open("settings.json", "r") as f:
-        settings = json.load(f)
-        mitm_port = settings["Port"]["MITM"]
-        rpc_port = settings["Port"]["XMLRPC"]
-        enable_unlocker = settings["Unlocker"]
-        enable_helper = settings["Helper"]
-        enable_playwright = settings["Playwright"]["enable"]
-        playwright_width = settings["Playwright"]["width"]
-        playwright_height = settings["Playwright"]["height"]
-        autohu = settings["Autohu"]
-        scale = playwright_width / 16
 
-    mitm_host="127.0.0.1"
-    rpc_host="127.0.0.1"
-
-    p = OptionParser()
-    p.add_option("--mitm-host", default=None)
-    p.add_option("--mitm-port", default=None)
-    p.add_option("--rpc-host", default=None)
-    p.add_option("--rpc-port", default=None)
-    p.add_option("--unlocker", default=None)
-    opts, arguments = p.parse_args()
-    if opts.mitm_host is not None:
-        mitm_host = opts.mitm_host
-    if opts.mitm_port is not None:
-        mitm_port = int(opts.mitm_port)
-    if opts.rpc_host is not None:
-        rpc_host = opts.rpc_host
-    if opts.rpc_port is not None:
-        rpc_port = int(opts.rpc_port)
-    if opts.unlocker is not None:
-        enable_unlocker = bool(opts.unlocker)
-
-    with open("mhmp.json", "r") as f:
-        mhmp = json.load(f)
-        mhmp["mitmdump"]["mode"] = [f"regular@{mitm_port}"]
-        mhmp["hook"]["enable_skins"] = enable_unlocker
-        mhmp["hook"]["enable_aider"] = enable_helper
-    with open("mhmp.json", "w") as f:
-        json.dump(mhmp, f, indent=4)
-    import mhm
-    print("fetching resver...")
-    mhm.fetch_resver()
-    # Create and start the proxy server thread
-    proxy_thread = threading.Thread(target=lambda: asyncio.run(start_proxy(mitm_host, mitm_port, enable_unlocker)))
-    proxy_thread.start()
-
-    liqiServer = LiqiServer(rpc_host, rpc_port)
-    # Create and start the LiqiServer thread
-    server_thread = threading.Thread(target=lambda: liqiServer.serve_forever())
-    server_thread.start()
-
-    page = None
-    if enable_playwright:
-        playwrightContextManager = sync_playwright()
-        playwright = playwrightContextManager.__enter__()
-        chromium = playwright.chromium
-        browser = chromium.launch_persistent_context(
-            user_data_dir=Path(__file__).parent / 'data',
-            headless=False,
-            viewport={'width': playwright_width, 'height': playwright_height},
-            proxy={"server": f"http://localhost:{mitm_port}"},
-            ignore_default_args=['--enable-automation']
+class MitmController:
+    """ Controlling mitm proxy server and xmlrpc server interactions and managing their threads
+    mitm proxy server intercepts data to/from the game server
+    XMLRPC server provides an interface for the bot to access the intercepted data
+    They are run as daemon threads, which exit when the main thread exits"""
+    
+    def __init__(self) -> None:
+        # Get config options from settings.json
+        with open("settings.json", "r") as f:
+            settings = json.load(f)
+            self.mitm_port = settings["Port"]["MITM"]
+            self.rpc_port = settings["Port"]["XMLRPC"]
+            self.enable_unlocker = settings["Unlocker"]
+            self.enable_helper = settings["Helper"]
+            self.enable_playwright = settings["Playwright"]["enable"]
+            self.playwright_width = settings["Playwright"]["width"]
+            self.playwright_height = settings["Playwright"]["height"]
+            self.browser:Browser = None
+            
+            self.mitm_host="127.0.0.1"
+            self.rpc_host="127.0.0.1"
+            self.mitm_thread:threading.Thread = None
+            self.rpc_thread:threading.Thread = None
+            self.dump_master = None
+            self.liqi_server:LiqiServer = None            
+            
+            # Check if 'mitm_config' folder exists, if not, create it
+            mitm_config_folder = pathlib.Path(__file__).parent / "mitm_config"
+            if not mitm_config_folder.exists():
+                mitm_config_folder.mkdir(exist_ok=True)
+            self.mitm_config_folder = str(mitm_config_folder.resolve())
+        
+    def start_mitm(self):
+        """ Start mitm server thread"""
+        # Update mhmp.json
+        logger.info(f"Updating mhmp.json")
+        with open("mhmp.json", "r") as f:
+            mhmp = json.load(f)
+            mhmp["mitmdump"]["mode"] = [f"regular@{self.mitm_port}"]
+            mhmp["hook"]["enable_skins"] = self.enable_unlocker
+            mhmp["hook"]["enable_aider"] = self.enable_helper
+        with open("mhmp.json", "w") as f:
+            json.dump(mhmp, f, indent=4)
+    
+        # Fetch res version  
+        import mhm
+        logger.info(f"Fetching resver...")
+        mhm.fetch_resver()
+        
+        # Start thread
+        self.mitm_thread = threading.Thread(
+            name="MITM Thread",
+            target=lambda: asyncio.run(self.run_mitm_async()),
+            daemon=True
         )
+        self.mitm_thread.start()
+        
+    
+    async def run_mitm_async(self):        
+        
+        opts = options.Options(listen_host=self.mitm_host, listen_port=self.mitm_port, confdir=self.mitm_config_folder)
 
-        print(f'startup browser success')
+        self.dump_master = DumpMaster(
+            opts,
+            with_termlog=False,
+            with_dumper=False,
+        )
+        self.dump_master.addons.add(ClientWebSocket())
+        if self.enable_unlocker:
+            self.dump_master.addons.add(ClientHTTP())
+        from mhm.addons import WebSocketAddon as Unlocker
+        self.dump_master.addons.add(Unlocker())
+        await self.dump_master.run()
+        return self.dump_master
+    
+    def shutdown_mitm(self):
+        """ shutdown mitm proxy server and join thread"""        
+        if self.dump_master:
+            self.dump_master.shutdown()
+            self.dump_master = None
+        if self.mitm_thread:
+            self.mitm_thread.join(timeout=5)
+            self.mitm_thread = None
+            
+    def start_xmlrpc(self):
+        """ Start xmlrpc server thread and browser thread"""
+        
+        # create the browser and action agent if playwright enabled
+        if self.enable_playwright:
+            self.browser = Browser(self.playwright_width, self.playwright_height, self.mitm_host, self.mitm_port)
+        else:
+            self.browser = None   
+        
+        # start liqi server
+        self.liqi_server = LiqiServer(self.rpc_host, self.rpc_port, self.browser)
+        self.rpc_thread = threading.Thread(
+            name="XMLRPC Thread",
+            target=self.liqi_server.start,
+            daemon=True)
+        self.rpc_thread.start()
+        
+        if self.browser:    # start browser
+            self.browser.start_browser()        
+        
+        
+    def shutdown_xmlrpc(self):
+        """ Shutdown xmlrpc server, browser, and join thread"""
+        if self.browser:
+            self.browser.shutdown_browser()
+            self.browser = None
+        if self.liqi_server:
+            self.liqi_server.shut_down()
+            self.liqi_server = None
+        if self.rpc_thread:
+            self.rpc_thread.join(timeout=5)
+            self.rpc_thread = None
+            
+            
+if __name__ == '__main__':
+    # Test MitmController
+    print("Test MitmController")
+    mitm_controller = MitmController()
+    
+    print("Start MITM")
+    mitm_controller.start_mitm()
+    print("Start XMLRPC")
+    mitm_controller.start_xmlrpc()
+    input("Press Enter to shut down...")
 
-        page = browser.new_page()
-
-        page.goto('https://game.maj-soul.com/1/')
-        print(f'go to page success, url: {page.url}')
-
-    click_list = []
-    do_autohu = False
-    # On Ctrl+C, stop the other threads
-    try:
-        while True:
-            if enable_playwright:
-                if len(click_list) > 0:
-                    xy = click_list.pop(0)
-                    xy_scale = {"x":xy[0]*scale,"y":xy[1]*scale}
-                    print(f"page_clicker: {xy_scale}")
-                    page.mouse.move(x=xy_scale["x"], y=xy_scale["y"])
-                    time.sleep(0.1)
-                    page.mouse.click(x=xy_scale["x"], y=xy_scale["y"], delay=100)
-                if do_autohu and autohu:
-                    print(f"do_autohu")
-                    page.evaluate("() => view.DesktopMgr.Inst.setAutoHule(true)")
-                    # page.locator("#layaCanvas").click(position=xy_scale)
-                    do_autohu = False
-            time.sleep(1)  # main thread will block here
-    except KeyboardInterrupt:
-        # On Ctrl+C, stop the other threads
-        if enable_playwright:
-            playwrightContextManager.__exit__()
-        ctx.master.shutdown()
-        liqiServer.server.shutdown()
-        exit(0)
-
-# else:
-with open("settings.json", "r") as f:
-    settings = json.load(f)
-    mitm_port = settings["Port"]["MITM"]
-    rpc_port = settings["Port"]["XMLRPC"]
-    enable_unlocker = settings["Unlocker"]
-if enable_unlocker:
-    from mhm.addons import WebSocketAddon as Unlocker
-    addons = [ClientWebSocket(), Unlocker()]
-else:
-    addons = [ClientWebSocket()]
-# start XMLRPC server
-rpc_host="127.0.0.1"
-liqiServer = LiqiServer(rpc_host, rpc_port)
-server_thread = threading.Thread(target=lambda: liqiServer.serve_forever())
-server_thread.start()
+    print("Shutting down XMLRPC")
+    mitm_controller.shutdown_xmlrpc()
+    print("Shutting down MITM")
+    mitm_controller.shutdown_mitm()
+    print("Finished.")

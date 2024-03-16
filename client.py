@@ -1,14 +1,10 @@
 import atexit
 import json
 import os
-import pathlib
-import subprocess
 import sys
 import time
+import os
 import webbrowser
-from pathlib import Path
-from sys import executable
-from threading import Thread
 from typing import Any, Coroutine
 from xmlrpc.client import ServerProxy
 
@@ -28,6 +24,7 @@ from liqi import LiqiProto, MsgType
 from majsoul2mjai import MajsoulBridge
 from libriichi_helper import meta_to_recommend, state_to_tehai
 from tileUnicode import TILE_2_UNICODE_ART_RICH, TILE_2_UNICODE, VERTICLE_RULE, HAI_VALUE
+from mitm import MitmController
 
 
 submission = 'players/bot.zip'
@@ -441,10 +438,12 @@ class Akagi(App):
         self.get_messages_flow = self.set_interval(0.05, self.get_messages)
 
     def refresh_flow(self) -> None:
+        # Update flow info from MITM
         if not self.mitm_started:
             return
         flows = self.rpc_server.get_activated_flows()
         for flow_id in self.active_flows:
+            # delete flows from active flow list if it's not in the refreshed list
             if flow_id not in flows:
                 try:
                     self.query_one(f"#flow_{flow_id}").remove()
@@ -458,6 +457,7 @@ class Akagi(App):
                 self.liqi.pop(flow_id)
                 self.bridge.pop(flow_id)
         for flow_id in flows:
+            # add new flows
             try:
                 self.query_one("#FlowContainer")
             except NoMatches:
@@ -475,6 +475,7 @@ class Akagi(App):
                 self.bridge[flow_id] = MajsoulBridge()
 
     def get_messages(self):
+        # Get messages from MITM
         if not self.mitm_started:
             return
         for flow_id in self.active_flows:
@@ -484,6 +485,7 @@ class Akagi(App):
                 messages = messages.data
                 assert isinstance(messages, bytes)
                 self.messages_dict[flow_id].append(messages)
+                # Parse proto message into python dict
                 liqi_msg = self.liqi[flow_id].parse(messages)
                 logger.info(liqi_msg)
                 if liqi_msg is not None:
@@ -519,6 +521,7 @@ class Akagi(App):
         pass
 
     def mitm_connected(self):
+        # Keep pinging rpc server until it's connected
         try:
             self.rpc_server.ping()
             self.mitm_started = True
@@ -532,9 +535,10 @@ class Akagi(App):
 
 
 def exit_handler():
-    global mitm_exec
+    global mitm
     try:
-        mitm_exec.kill()
+        mitm.shutdown_xmlrpc()
+        mitm.shutdown_mitm()
         logger.info("Stop Akagi")
     except:
         pass
@@ -542,24 +546,38 @@ def exit_handler():
 
 
 def start_mitm():
-    global mitm_exec
+    global mitm
+    mitm = MitmController()
+    mitm.start_mitm()
+    mitm.start_xmlrpc()
 
-    command = [sys.executable, pathlib.Path(__file__).parent / "mitm.py"]
 
+def set_terminal_window_size():
+    """ Adjust the terminal size"""
     if sys.platform == "win32":
-        # Windows特定代码
-        mitm_exec = subprocess.Popen(command, creationflags=subprocess.CREATE_NEW_CONSOLE)
+        # For Windows system
+        os.system("mode con cols=120 lines=40")
+    elif sys.platform == "darwin":
+        # For MacOS 
+        applescript = """
+        tell application "Terminal"
+            set current settings of window 1 to settings set "Pro"
+            set bounds of window 1 to {100, 100, %d, %d}
+        end tell
+        """ % (800, 600)
+        os.system("osascript -e '{}'".format(applescript))
     else:
-        # macOS和其他Unix-like系统
-        mitm_exec = subprocess.Popen(command, preexec_fn=os.setsid)
-
+        pass
 
 if __name__ == '__main__':
     with open("settings.json", "r") as f:
         settings = json.load(f)
         rpc_port = settings["Port"]["XMLRPC"]
     rpc_host = "127.0.0.1"
+    # the rpc server that connects to mitm proxy program
     s = ServerProxy(f"http://{rpc_host}:{rpc_port}", allow_none=True)
+    
+    set_terminal_window_size()
     app = Akagi(rpc_server=s)
     atexit.register(exit_handler)
     try:
